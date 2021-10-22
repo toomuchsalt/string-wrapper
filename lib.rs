@@ -1,37 +1,39 @@
 //! provides `StringWrapper`, most useful for stack-based strings.
 #![deny(missing_docs)]
 
-#[cfg(feature="use_serde")]
+#[cfg(feature = "use_serde")]
 #[macro_use]
 extern crate serde_derive;
-#[cfg(feature="use_serde")]
+#[cfg(feature = "use_serde")]
 extern crate serde;
 
-use std::borrow;
+use std::cmp;
 use std::fmt;
+use std::hash;
 use std::io::Write;
-use std::mem::transmute;
 use std::ops;
 use std::ptr;
 use std::str;
-use std::cmp;
-use std::hash;
+use std::str::FromStr;
 
-#[cfg(feature="use_serde")]
+#[cfg(feature = "use_serde")]
 use serde::de::Error;
 
 /// Like `String`, but with a fixed capacity and a generic backing bytes storage.
 ///
 /// Use e.g. `StringWrapper<[u8; 4]>` to have a string without heap memory allocation.
-#[derive(Copy, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct StringWrapper<T>
-    where T: Buffer
+where
+    T: Buffer,
 {
     len: usize,
     buffer: T,
 }
 
 /// Equivalent to `AsMut<[u8]> + AsRef<[u8]>` with the additional constraint that
+/// # Safety
+///
 /// implementations must return the same slice from subsequent calls of `as_mut` and/or `as_ref`.
 pub unsafe trait Buffer {
     /// Get the backing buffer as a slice.
@@ -40,40 +42,48 @@ pub unsafe trait Buffer {
     fn as_mut(&mut self) -> &mut [u8];
 }
 
-/// The OwnedBuffer trait is in support of StringWrapper::from_str, since we need to be able to
+/// The `OwnedBuffer` trait is in support of `StringWrapper::from_str`, since we need to be able to
 /// allocate new buffers for it.
 ///
-/// IMPLEMENTATION NOTE: There is currently no impl for Vec<u8>, because StringWrapper assumes a
+/// IMPLEMENTATION NOTE: There is currently no impl for `Vec<u8>`, because `StringWrapper` assumes a
 /// fixed capacity, and we don't have a way to know what size vec we should return.
 // Besides, I'm not sure what the value of Buffer for Vec is anyway, when you could just use
 // String...
 pub trait OwnedBuffer: Buffer {
-    /// Creature a new buffer that can be used to initialize a StringWrapper.
+    /// Creature a new buffer that can be used to initialize a `StringWrapper`.
     fn new() -> Self;
 }
 
+/// Error type returned by `StringWrapper` implementation
+#[derive(Debug, Eq, PartialEq)]
+pub enum Error {
+    /// Returned from from_str and push in case when not enough extra capacity is available
+    InsufficientLength {
+        /// Amount of space required for this operation to complete
+        expected: usize,
+        /// available space
+        actual: usize,
+    },
+}
+
 impl<T> StringWrapper<T>
-    where T: Buffer
+where
+    T: Buffer,
 {
     /// Create an empty string from its backing storage.
     pub fn new(buffer: T) -> Self {
-        StringWrapper {
-            len: 0,
-            buffer: buffer,
-        }
+        StringWrapper { len: 0, buffer }
     }
 
     /// Unsafely create a string from its components.
     ///
+    /// # Safety
     /// Users must ensure that:
     ///
     /// * The buffer length is at least `len`
     /// * The first `len` bytes of `buffer` are well-formed UTF-8.
     pub unsafe fn from_raw_parts(buffer: T, len: usize) -> Self {
-        StringWrapper {
-            len: len,
-            buffer: buffer,
-        }
+        StringWrapper { len, buffer }
     }
 
     /// Consume the string and return the backing storage.
@@ -86,9 +96,9 @@ impl<T> StringWrapper<T>
         self.buffer.as_ref()
     }
 
-
     /// View the backing storage as a bytes slice.
     ///
+    /// # Safety
     /// Users must ensure that the prefix bytes up to `self.len()` remains well-formed UTF-8.
     pub unsafe fn buffer_mut(&mut self) -> &mut [u8] {
         self.buffer.as_mut()
@@ -105,19 +115,22 @@ impl<T> StringWrapper<T>
     }
 
     /// Unsafely change the length in bytes of the string.
-    ///
+    /// # Safety
     /// Users must ensure that the string remains well-formed UTF-8.
     pub unsafe fn set_len(&mut self, new_len: usize) {
-        self.len = new_len
+        self.len = new_len;
     }
 
     /// Shortens a string to the specified length.
     ///
+    /// # Panics
     /// Panics if `new_len` > current length, or if `new_len` is not a character boundary.
     pub fn truncate(&mut self, new_len: usize) {
         assert!(new_len <= self.len);
         if new_len < self.len {
-            assert!(starts_well_formed_utf8_sequence(self.buffer.as_ref()[new_len]));
+            assert!(starts_well_formed_utf8_sequence(
+                self.buffer.as_ref()[new_len]
+            ));
         }
         self.len = new_len;
     }
@@ -139,8 +152,11 @@ impl<T> StringWrapper<T>
 
     /// Append a code point to the string if the extra capacity is sufficient.
     ///
+    /// # Errors
+    /// return `Err(())` if extra capacity is insufficient
+    ///
     /// Return `Ok` with the code point appended, or `Err` with the string unchanged.
-    pub fn push(&mut self, c: char) -> Result<(), ()> {
+    pub fn push(&mut self, c: char) -> Result<(), Error> {
         let new_len = self.len + c.len_utf8();
         if new_len <= self.capacity() {
             // FIXME: use `c.encode_utf8` once it’s stable.
@@ -148,7 +164,10 @@ impl<T> StringWrapper<T>
             self.len = new_len;
             Ok(())
         } else {
-            Err(())
+            Err(Error::InsufficientLength {
+                expected: new_len,
+                actual: self.capacity(),
+            })
         }
     }
 
@@ -163,7 +182,9 @@ impl<T> StringWrapper<T>
     /// Append as much as possible of a string slice to the string.
     ///
     /// Return `Ok(())` if the extra capacity was sufficient,
-    /// or `Err(n)` where `n` is the number of bytes pushed.
+    ///
+    /// # Errors
+    /// `Err(n)` where `n` is the number of bytes pushed.
     /// `n` is within 3 bytes of the extra capacity.
     pub fn push_partial_str(&mut self, s: &str) -> Result<(), usize> {
         let mut i = self.extra_capacity();
@@ -171,7 +192,7 @@ impl<T> StringWrapper<T>
             // As long as `self` is well-formed,
             // this loop does as most 3 iterations and `i` does not underflow.
             while !starts_well_formed_utf8_sequence(s.as_bytes()[i]) {
-                i -= 1
+                i -= 1;
             }
             (&s[..i], Err(i))
         } else {
@@ -182,30 +203,25 @@ impl<T> StringWrapper<T>
     }
 }
 
-impl<T: OwnedBuffer> StringWrapper<T> {
-    /// Copy a `&str` into a new `StringWrapper`. You may need to annotate the type of this call so
-    /// Rust knows which size of array you want to populate:
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `&str` cannot fit into the buffer.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use string_wrapper::StringWrapper;
-    ///
-    /// let sw: StringWrapper<[u8; 32]> = StringWrapper::from_str("hello, world");
-    /// assert_eq!(format!("{}", sw), "hello, world");
-    /// ```
-    pub fn from_str(s: &str) -> StringWrapper<T> {
+impl<T: OwnedBuffer> FromStr for StringWrapper<T> {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let buffer = T::new();
+        if s.len() > buffer.as_ref().len() {
+            return Err(Error::InsufficientLength {
+                expected: s.len(),
+                actual: buffer.as_ref().len(),
+            });
+        }
         let mut sw = StringWrapper::new(buffer);
         sw.push_str(s);
-        sw
+        Ok(sw)
     }
+}
 
-    /// Safely construct a new StringWrapper from a &str. Unlike `from_str`, this method doesn't
+impl<T: OwnedBuffer> StringWrapper<T> {
+    /// Safely construct a new `StringWrapper` from a &str. Unlike `from_str`, this method doesn't
     /// panic when the &str is too big to fit into the buffer.
     ///
     /// # Examples
@@ -223,6 +239,7 @@ impl<T: OwnedBuffer> StringWrapper<T> {
     /// let sw: Option<StringWrapper<[u8; 3]>> = StringWrapper::from_str_safe("foobar");
     /// assert_eq!(sw, None);
     /// ```
+    #[must_use]
     pub fn from_str_safe(s: &str) -> Option<StringWrapper<T>> {
         let buffer = T::new();
         let mut sw = StringWrapper::new(buffer);
@@ -235,7 +252,7 @@ impl<T: OwnedBuffer> StringWrapper<T> {
 
 fn starts_well_formed_utf8_sequence(byte: u8) -> bool {
     // ASCII byte or "leading" byte
-    byte < 128 || byte >= 192
+    !(128..192).contains(&byte)
 }
 
 // FIXME: Use `std::slice::bytes::copy_memory` instead when it’s stable.
@@ -253,7 +270,8 @@ fn copy_memory(src: &[u8], dst: &mut [u8]) {
 }
 
 impl<T> ops::Deref for StringWrapper<T>
-    where T: Buffer
+where
+    T: Buffer,
 {
     type Target = str;
 
@@ -263,15 +281,17 @@ impl<T> ops::Deref for StringWrapper<T>
 }
 
 impl<T> ops::DerefMut for StringWrapper<T>
-    where T: Buffer
+where
+    T: Buffer,
 {
     fn deref_mut(&mut self) -> &mut str {
-        unsafe { transmute::<&mut [u8], &mut str>(&mut self.buffer.as_mut()[..self.len]) }
+        unsafe { str::from_utf8_unchecked_mut(&mut self.buffer.as_mut()[..self.len]) }
     }
 }
 
-impl<T> borrow::Borrow<str> for StringWrapper<T>
-    where T: Buffer
+impl<T> core::borrow::Borrow<str> for StringWrapper<T>
+where
+    T: Buffer,
 {
     fn borrow(&self) -> &str {
         self
@@ -279,7 +299,8 @@ impl<T> borrow::Borrow<str> for StringWrapper<T>
 }
 
 impl<T> fmt::Display for StringWrapper<T>
-    where T: Buffer
+where
+    T: Buffer,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
@@ -287,7 +308,8 @@ impl<T> fmt::Display for StringWrapper<T>
 }
 
 impl<T> fmt::Debug for StringWrapper<T>
-    where T: Buffer
+where
+    T: Buffer,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
@@ -303,16 +325,6 @@ impl<T: Buffer> PartialEq for StringWrapper<T> {
 // We need to explicitly define Eq here, because the derive logic only impls it when T is also Eq.
 impl<T: Buffer> Eq for StringWrapper<T> {}
 
-// Likewise we need to implement Clone explicitly because std doesn't define it for arrays bigger
-// than 32 elements. We rely on cloning the slice of the array and then copying that into a new
-// buffer, which requires OwnedBuffer::new.
-impl<T: Buffer + Copy> Clone for StringWrapper<T> {
-    fn clone(&self) -> Self {
-        *self
-
-    }
-}
-
 impl<T: Buffer> PartialOrd for StringWrapper<T> {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
@@ -321,7 +333,7 @@ impl<T: Buffer> PartialOrd for StringWrapper<T> {
 
 impl<T: Buffer> hash::Hash for StringWrapper<T> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
-        (**self).hash(state)
+        (**self).hash(state);
     }
 }
 
@@ -331,31 +343,38 @@ impl<T: Buffer> Ord for StringWrapper<T> {
     }
 }
 
-#[cfg(feature="use_serde")]
+impl<T: Buffer> fmt::Write for StringWrapper<T> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.push_str(s);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "use_serde")]
 impl<T: Buffer> serde::Serialize for StringWrapper<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.to_string().serialize(serializer)
     }
 }
 
-#[cfg(feature="use_serde")]
+#[cfg(feature = "use_serde")]
 impl<'de, T: OwnedBuffer> serde::Deserialize<'de> for StringWrapper<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s: String = serde::Deserialize::deserialize(deserializer)?;
         let sb = StringWrapper::from_str_safe(&s).ok_or_else(|| {
-                let buff = T::new();
-                let msg: String = format!("string that can fit into {} bytes", buff.as_ref().len());
-                D::Error::invalid_length(s.len(), &StringExpected(msg))
-            })?;
+            let buff = T::new();
+            let msg: String = format!("string that can fit into {} bytes", buff.as_ref().len());
+            D::Error::invalid_length(s.len(), &StringExpected(msg))
+        })?;
         Ok(sb)
     }
 }
 
 // It seems silly that I can't just pass a String to invalid_length, but there's no implementation
 // of Expected for String, so...
-#[cfg(feature="use_serde")]
+#[cfg(feature = "use_serde")]
 struct StringExpected(String);
-#[cfg(feature="use_serde")]
+#[cfg(feature = "use_serde")]
 impl serde::de::Expected for StringExpected {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(&self.0, formatter)
@@ -407,7 +426,7 @@ macro_rules! array_impl {
             }
 
             impl OwnedBuffer for [u8; $N] {
-                fn new() -> Self { [0u8; $N] }
+                fn new() -> Self { [0_u8; $N] }
             }
         )+
     }
@@ -417,8 +436,8 @@ array_impl! {
      0  1  2  3  4  5  6  7  8  9
     10 11 12 13 14 15 16 17 18 19
     20 21 22 23 24 25 26 27 28 29
-    30 31 32
-    64 128 256 512 1024
+    30 31 32 64
+    128 256 512 1024
     2 * 1024
     4 * 1024
     8 * 1024
@@ -426,30 +445,18 @@ array_impl! {
     32 * 1024
     64 * 1024
     128 * 1024
-    256 * 1024
-    512 * 1024
-    1024 * 1024
-    2 * 1024 * 1024
-    4 * 1024 * 1024
-    8 * 1024 * 1024
-    16 * 1024 * 1024
-    32 * 1024 * 1024
-    64 * 1024 * 1024
-    128 * 1024 * 1024
-    256 * 1024 * 1024
-    512 * 1024 * 1024
-    1024 * 1024 * 1024
-    100 1_000 10_000 100_000 1_000_000
-    10_000_000 100_000_000 1_000_000_000
 }
 
 #[cfg(test)]
+#[allow(clippy::non_ascii_literal)]
 mod tests {
+    use Error;
     use std;
     use std::cmp;
     use std::hash;
+    use std::str::FromStr;
 
-    #[cfg(feature="use_serde")]
+    #[cfg(feature = "use_serde")]
     extern crate serde_json;
 
     use StringWrapper;
@@ -464,6 +471,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::eq_op)]
     fn eq() {
         let mut s = StringWrapper::<[u8; 3]>::new(*b"000");
         assert_eq!(s, s);
@@ -517,8 +525,8 @@ mod tests {
 
     #[test]
     fn hash_only_to_length() {
-        let mut s = StringWrapper::<[u8; 64]>::new([0u8; 64]);
-        let mut s2 = StringWrapper::<[u8; 64]>::new([1u8; 64]);
+        let mut s = StringWrapper::<[u8; 64]>::new([0_u8; 64]);
+        let mut s2 = StringWrapper::<[u8; 64]>::new([1_u8; 64]);
         assert_eq!(hash(&s), hash(&s2));
         s.push_str("a");
         assert!(hash(&s) != hash(&s2));
@@ -528,8 +536,8 @@ mod tests {
 
     #[test]
     fn from_str() {
-        let s: StringWrapper<[u8; 64]> = StringWrapper::from_str("OMG!");
-        let mut s2 = StringWrapper::new([0u8; 64]);
+        let s: StringWrapper<[u8; 64]> = StringWrapper::from_str("OMG!").unwrap();
+        let mut s2 = StringWrapper::new([0_u8; 64]);
         s2.push_str("OMG!");
         assert_eq!(s, s2);
     }
@@ -583,14 +591,19 @@ mod tests {
         assert_eq!(s.capacity(), 10);
         assert_eq!(s.extra_capacity(), 3);
 
-        assert_eq!(s.push('🌠'), Err(()));
+        assert_eq!(
+            s.push('🌠'),
+            Err(Error::InsufficientLength {
+                expected: 11,
+                actual: 10
+            })
+        );
         assert_eq!(&*s, "aé~~~_");
         assert_eq!(s.len(), 7);
         assert_eq!(s.capacity(), 10);
         assert_eq!(s.extra_capacity(), 3);
 
-
-        let buffer: [u8; 10] = s.clone().into_buffer();
+        let buffer: [u8; 10] = s.into_buffer();
         assert_eq!(&buffer, b"a\xC3\xA9~~~_ell");
         assert_eq!(format!("{}", s), "aé~~~_");
         assert_eq!(format!("{:?}", s), r#""aé~~~_""#);
@@ -602,7 +615,7 @@ mod tests {
         assert_eq!(s.extra_capacity(), 0);
     }
 
-    #[cfg(feature="use_serde")]
+    #[cfg(feature = "use_serde")]
     #[test]
     fn test_serde() {
         let mut s = StringWrapper::new([0u8; 64]);
@@ -613,22 +626,25 @@ mod tests {
         assert_eq!(s, s2);
     }
 
-    #[cfg(feature="use_serde")]
+    #[cfg(feature = "use_serde")]
     #[test]
     fn deserialize_too_long() {
         let json = "\"12345\"";
         match serde_json::from_str::<StringWrapper<[u8; 3]>>(&json) {
             Err(e) => {
-                assert_eq!(format!("{}", e),
-                           "invalid length 5, expected string that can fit into 3 bytes")
+                assert_eq!(
+                    format!("{}", e),
+                    "invalid length 5, expected string that can fit into 3 bytes"
+                )
             }
             Ok(x) => panic!("Expected error, got success: {:?}", x),
         }
     }
 
+    #[allow(clippy::clone_on_copy)]
     #[test]
     fn clone() {
-        let s = StringWrapper::new([0u8; 64]);
+        let s = StringWrapper::new([0_u8; 64]);
         let y: StringWrapper<[u8; 64]> = s.clone();
         println!("s: {}, y: {}", s, y);
     }
