@@ -430,6 +430,19 @@ impl<const N: usize> OwnedBuffer for [u8; N] {
     fn new() -> Self { [0_u8; N] }
 }
 
+/// Like a `format!` but uses a fixed size buffer of specified length
+#[macro_export]
+macro_rules! stack_format {
+    ($limit:literal, $($args:tt)*) => {
+        {
+            use std::fmt::Write;
+            let mut sw = $crate::StringWrapper::new([0u8; $limit]);
+            let r = write!(sw, $($args)*);
+            r.map(|_: ()| sw)
+        }
+    };
+}
+
 #[cfg(test)]
 #[allow(clippy::non_ascii_literal)]
 mod tests {
@@ -630,5 +643,14 @@ mod tests {
         let s = StringWrapper::new([0_u8; 64]);
         let y: StringWrapper<[u8; 64]> = s.clone();
         println!("s: {}, y: {}", s, y);
+    }
+
+    #[test]
+    fn test_stack_format() {
+        let s = stack_format!(128, "{}{}{}", 1, 2, 3).unwrap();
+        assert_eq!(&*s, "123");
+
+        let s2 = stack_format!(4, "{}", 12345);
+        s2.expect_err("expected error");
     }
 }
