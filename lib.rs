@@ -2,9 +2,6 @@
 #![deny(missing_docs)]
 
 #[cfg(feature = "use_serde")]
-#[macro_use]
-extern crate serde_derive;
-#[cfg(feature = "use_serde")]
 extern crate serde;
 
 use std::cmp;
@@ -15,9 +12,6 @@ use std::ops;
 use std::ptr;
 use std::str;
 use std::str::FromStr;
-
-#[cfg(feature = "use_serde")]
-use serde::de::Error;
 
 /// Like `String`, but with a fixed capacity and a generic backing bytes storage.
 ///
@@ -364,6 +358,9 @@ impl<'de, T: OwnedBuffer> serde::Deserialize<'de> for StringWrapper<T> {
         let sb = StringWrapper::from_str_safe(&s).ok_or_else(|| {
             let buff = T::new();
             let msg: String = format!("string that can fit into {} bytes", buff.as_ref().len());
+
+            use serde::de::Error;
+
             D::Error::invalid_length(s.len(), &StringExpected(msg))
         })?;
         Ok(sb)
@@ -390,7 +387,7 @@ unsafe impl<'a, T: ?Sized + Buffer> Buffer for &'a mut T {
     }
 }
 
-unsafe impl<'a, T: ?Sized + Buffer> Buffer for Box<T> {
+unsafe impl<T: ?Sized + Buffer> Buffer for Box<T> {
     fn as_ref(&self) -> &[u8] {
         (**self).as_ref()
     }
