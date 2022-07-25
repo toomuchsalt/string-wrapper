@@ -417,34 +417,18 @@ unsafe impl Buffer for [u8] {
     }
 }
 
-macro_rules! array_impl {
-    ($($N: expr)+) => {
-        $(
-            unsafe impl Buffer for [u8; $N] {
-                fn as_ref(&self) -> &[u8] { self }
-                fn as_mut(&mut self) -> &mut [u8] { self }
-            }
+unsafe impl<const N: usize> Buffer for [u8; N] {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
 
-            impl OwnedBuffer for [u8; $N] {
-                fn new() -> Self { [0_u8; $N] }
-            }
-        )+
+    fn as_mut(&mut self) -> &mut [u8] {
+        self
     }
 }
 
-array_impl! {
-     0  1  2  3  4  5  6  7  8  9
-    10 11 12 13 14 15 16 17 18 19
-    20 21 22 23 24 25 26 27 28 29
-    30 31 32 64
-    128 256 512 1024
-    2 * 1024
-    4 * 1024
-    8 * 1024
-    16 * 1024
-    32 * 1024
-    64 * 1024
-    128 * 1024
+impl<const N: usize> OwnedBuffer for [u8; N] {
+    fn new() -> Self { [0_u8; N] }
 }
 
 #[cfg(test)]
