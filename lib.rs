@@ -168,9 +168,13 @@ where
     /// Append a string slice to the string.
     ///
     /// Panics if the extra capacity is not sufficient.
-    pub fn push_str(&mut self, s: &str) {
+    pub fn push_str(&mut self, s: &str) -> Result<(), Error> {
+        if self.extra_capacity() < s.len() {
+            return Err(Error::InsufficientLength{ expected: s.len(), actual: self.extra_capacity() })
+        }
         copy_memory(s.as_bytes(), self.extra_bytes_mut());
         self.len += s.len();
+        Ok(())
     }
 
     /// Append as much as possible of a string slice to the string.
@@ -192,7 +196,7 @@ where
         } else {
             (s, Ok(()))
         };
-        self.push_str(s);
+        self.push_str(s).unwrap();
         result
     }
 }
@@ -202,15 +206,9 @@ impl<T: OwnedBuffer> FromStr for StringWrapper<T> {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let buffer = T::new();
-        if s.len() > buffer.as_ref().len() {
-            return Err(Error::InsufficientLength {
-                expected: s.len(),
-                actual: buffer.as_ref().len(),
-            });
-        }
         let mut sw = StringWrapper::new(buffer);
-        sw.push_str(s);
-        Ok(sw)
+        let res = sw.push_str(s);
+        res.map(|_: ()| sw)
     }
 }
 
@@ -339,8 +337,12 @@ impl<T: Buffer> Ord for StringWrapper<T> {
 
 impl<T: Buffer> fmt::Write for StringWrapper<T> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.push_str(s);
-        Ok(())
+        let res = self.push_str(s);
+        if res.is_err() {
+            Err(fmt::Error)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -456,14 +458,14 @@ mod tests {
     fn eq() {
         let mut s = StringWrapper::<[u8; 3]>::new(*b"000");
         assert_eq!(s, s);
-        s.push_str("foo");
+        s.push_str("foo").unwrap();
         let mut s2 = StringWrapper::<[u8; 3]>::new(*b"000");
-        s2.push_str("foo");
+        s2.push_str("foo").unwrap();
         assert_eq!(s, s2);
 
         let mut s3 = StringWrapper::<[u8; 3]>::new(*b"000");
-        s3.push_str("bar");
-        assert!(s != s3);
+        s3.push_str("bar").unwrap();
+        assert_ne!(s, s3);
     }
 
     #[test]
@@ -477,8 +479,8 @@ mod tests {
     fn ord() {
         let mut s = StringWrapper::<[u8; 3]>::new(*b"000");
         let mut s2 = StringWrapper::<[u8; 3]>::new(*b"000");
-        s.push_str("a");
-        s2.push_str("b");
+        s.push_str("a").unwrap();
+        s2.push_str("b").unwrap();
         assert_eq!(s.partial_cmp(&s2), Some(cmp::Ordering::Less));
         assert_eq!(s.cmp(&s2), cmp::Ordering::Less);
     }
@@ -490,8 +492,8 @@ mod tests {
         assert_eq!(s.partial_cmp(&s2), Some(cmp::Ordering::Equal));
         assert_eq!(s.cmp(&s2), cmp::Ordering::Equal);
 
-        s.push_str("aa");
-        s2.push_str("aa");
+        s.push_str("aa").unwrap();
+        s2.push_str("aa").unwrap();
         assert_eq!(s.partial_cmp(&s2), Some(cmp::Ordering::Equal));
         assert_eq!(s.cmp(&s2), cmp::Ordering::Equal);
     }
@@ -509,9 +511,9 @@ mod tests {
         let mut s = StringWrapper::<[u8; 64]>::new([0_u8; 64]);
         let mut s2 = StringWrapper::<[u8; 64]>::new([1_u8; 64]);
         assert_eq!(hash(&s), hash(&s2));
-        s.push_str("a");
+        s.push_str("a").unwrap();
         assert!(hash(&s) != hash(&s2));
-        s2.push_str("a");
+        s2.push_str("a").unwrap();
         assert_eq!(hash(&s), hash(&s2));
     }
 
@@ -519,7 +521,7 @@ mod tests {
     fn from_str() {
         let s: StringWrapper<[u8; 64]> = StringWrapper::from_str("OMG!").unwrap();
         let mut s2 = StringWrapper::new([0_u8; 64]);
-        s2.push_str("OMG!");
+        s2.push_str("OMG!").unwrap();
         assert_eq!(s, s2);
     }
 
@@ -536,7 +538,7 @@ mod tests {
         assert_eq!(s.capacity(), 10);
         assert_eq!(s.extra_capacity(), 10);
 
-        s.push_str("a");
+        s.push_str("a").unwrap();
         assert_eq!(&*s, "a");
         assert_eq!(s.len(), 1);
         assert_eq!(s.capacity(), 10);
@@ -600,7 +602,7 @@ mod tests {
     #[test]
     fn test_serde() {
         let mut s = StringWrapper::new([0u8; 64]);
-        s.push_str("foobar");
+        s.push_str("foobar").unwrap();
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(json, "\"foobar\"");
         let s2 = serde_json::from_str(&json).unwrap();
